@@ -1,5 +1,5 @@
 import {
-    editorEditorField,
+    debounce,
     MarkdownPostProcessorContext,
     Plugin,
     TFile
@@ -10,21 +10,19 @@ import {
     DecorationSet,
     ViewUpdate,
     ViewPlugin,
-    PluginField
+    PluginField,
+    WidgetType
 } from "@codemirror/view";
 import { syntaxTree } from "@codemirror/language";
 import { tokenClassNodeProp } from "@codemirror/stream-parser";
 
 import Processor from "./processor";
-import { RangeSetBuilder } from "@codemirror/rangeset";
+import { RangeSetBuilder, Range } from "@codemirror/rangeset";
 import {
-    EditorState,
     StateEffect,
     StateField,
     Transaction,
-    Prec,
-    TransactionSpec,
-    Facet,
+    StateEffectType,
     SelectionRange
 } from "@codemirror/state";
 
@@ -41,6 +39,235 @@ export default class MarkdownAttributes extends Plugin {
     }
 
     state() {
+        //https://gist.github.com/nothingislost/faa89aa723254883d37f45fd16162337
+        type TokenSpec =
+            | {
+                  from: number;
+                  to: number;
+                  value: string;
+                  attributes: [string, string][];
+                  type: "mark";
+              }
+            | {
+                  from: number;
+                  to: number;
+                  value: string;
+                  index: number;
+                  type: "replace";
+              };
+
+        const statefulDecorations = defineStatefulDecoration();
+
+        class StatefulDecorationSet {
+            editor: EditorView;
+            decoCache: { [cls: string]: Decoration } = Object.create(null);
+
+            constructor(editor: EditorView) {
+                this.editor = editor;
+            }
+
+            async computeAsyncDecorations(tokens: TokenSpec[]) {
+                const mark: Range<Decoration>[] = [];
+                const replace: Range<Decoration>[] = [];
+                for (let token of tokens) {
+                    let deco = this.decoCache[token.value];
+                    if (!deco) {
+                        switch (token.type) {
+                            case "mark": {
+                                mark.push(
+                                    Decoration.mark({
+                                        attributes: Object.fromEntries(
+                                            token.attributes
+                                        )
+                                    }).range(token.from, token.to)
+                                );
+                                break;
+                            }
+                            case "replace": {
+                                replace.push(
+                                    Decoration.replace({
+                                        inclusive: true,
+                                        widget: new ReplaceWidget(
+                                            token.value,
+                                            true
+                                        )
+                                    }).range(token.from, token.to)
+                                );
+                            }
+                        }
+                    }
+                }
+                return {
+                    mark: Decoration.set(mark, true),
+                    replace: Decoration.set(replace, true)
+                };
+            }
+
+            async updateAsyncDecorations(tokens: TokenSpec[]): Promise<void> {
+                const { mark, replace } = await this.computeAsyncDecorations(
+                    tokens
+                );
+                // if our compute function returned nothing and the state field still has decorations, clear them out
+                if (
+                    mark ||
+                    replace ||
+                    this.editor.state.field(statefulDecorations.field).size
+                ) {
+                    this.editor.dispatch({
+                        effects: [
+                            statefulDecorations.update.of(
+                                mark || Decoration.none
+                            ),
+                            statefulDecorations.replace.of(
+                                replace || Decoration.none
+                            )
+                        ]
+                    });
+                }
+            }
+        }
+
+        class ReplaceWidget extends WidgetType {
+            constructor(public text: string, public hide: boolean) {
+                super();
+            }
+            eq(other: ReplaceWidget) {
+                return other.text == this.text && other.hide == this.hide;
+            }
+            toDOM(view: EditorView) {
+                return createSpan({ text: this.hide ? "" : this.text });
+            }
+        }
+
+        const asyncViewPlugin = ViewPlugin.fromClass(
+            class {
+                decoManager: StatefulDecorationSet;
+
+                constructor(view: EditorView) {
+                    this.decoManager = new StatefulDecorationSet(view);
+                    this.buildAsyncDecorations(view);
+                }
+
+                update(update: ViewUpdate) {
+                    if (update.docChanged || update.viewportChanged) {
+                        this.buildAsyncDecorations(update.view);
+                    }
+                }
+
+                destroy() {}
+
+                buildAsyncDecorations(view: EditorView) {
+                    const targetElements: TokenSpec[] = [];
+                    for (let { from, to } of view.visibleRanges) {
+                        const tree = syntaxTree(view.state);
+                        tree.iterate({
+                            from,
+                            to,
+                            enter: (type, from, to) => {
+                                const tokenProps =
+                                    type.prop(tokenClassNodeProp);
+                                if (!tokenProps) return;
+
+                                const props = new Set(tokenProps?.split(" "));
+
+                                if (!props.size) return;
+                                if (props.has("hmd-codeblock")) return;
+
+                                const original = view.state.doc.sliceString(
+                                    from,
+                                    to
+                                );
+
+                                if (!Processor.END_RE.test(original)) return;
+
+                                const parsed = Processor.parse(original) ?? [];
+
+                                for (const item of parsed) {
+                                    const { attributes, text } = item;
+
+                                    targetElements.push({
+                                        from,
+                                        to,
+                                        attributes,
+                                        value: text,
+                                        type: "mark"
+                                    });
+
+                                    const match = original.match(
+                                        new RegExp(`\\{\\s?${text}\s?\\}`)
+                                    );
+                                    targetElements.push({
+                                        type: "replace",
+                                        from: from + match.index - 1,
+                                        to:
+                                            from +
+                                            match.index +
+                                            match[0].length,
+                                        value: match[0],
+                                        index: match.index
+                                    });
+                                }
+                            }
+                        });
+                    }
+                    this.decoManager.updateAsyncDecorations(targetElements);
+                }
+            }
+        );
+
+        ////////////////
+        // Utility Code
+        ////////////////
+
+        function defineStatefulDecoration() {
+            const update = StateEffect.define<DecorationSet>();
+            const replace = StateEffect.define<DecorationSet>();
+            const field = StateField.define<DecorationSet>({
+                create(): DecorationSet {
+                    return Decoration.none;
+                },
+                update(deco, tr): DecorationSet {
+                    if (tr.newSelection) {
+                        console.log(
+                            "🚀 ~ file: main.ts ~ line 233 ~ tr.newSelection",
+                            tr.newSelection.ranges
+                        );
+                        for (const effect of tr.effects) {
+                            if (effect.is(replace)) {
+                                effect.value.between(
+                                    tr.newSelection.ranges[0].from,
+                                    tr.newSelection.ranges[0].to,
+                                    (from, to, decoration) => {
+                                        console.log(
+                                            "🚀 ~ file: main.ts ~ line 239 ~ decoration",
+                                            decoration
+                                        );
+                                        if (decoration.spec.widget.hide) {
+                                            decoration.spec.widget.hide = false;
+                                        }
+                                    }
+                                );
+                            }
+                        }
+                    }
+
+                    return tr.effects.reduce(
+                        (deco, effect) =>
+                            effect.is(update) || effect.is(replace)
+                                ? effect.value
+                                : deco,
+                        deco.map(tr.changes)
+                    );
+                },
+                provide: (field) => EditorView.decorations.from(field)
+            });
+            return { update, field, replace };
+        }
+
+        return [statefulDecorations.field, asyncViewPlugin];
+    }
+
+    state_old() {
         const DecorationField = PluginField.define<DecorationSet>();
         const decorator = ViewPlugin.fromClass(
             class {
