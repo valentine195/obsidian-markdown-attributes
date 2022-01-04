@@ -22,7 +22,8 @@ import {
     StateEffect,
     StateField,
     Transaction,
-    Prec, Facet
+    Prec,
+    Facet
 } from "@codemirror/state";
 
 type ReplaceEffect = { from: number; to: number; text: string };
@@ -35,24 +36,68 @@ export default class MarkdownAttributes extends Plugin {
         this.registerMarkdownPostProcessor(this.postprocessor.bind(this));
 
         this.registerEditorExtension(this.state());
-        this.registerEditorExtension(this.decorator());
-        /* this.registerEditorExtension(this.replacer()); */
+        /* this.registerEditorExtension(this.decorator());
+        this.registerEditorExtension(this.replacer()); */
     }
 
     state() {
+        //reference https://github.com/ozntel/oz-image-in-editor-obsidian/blob/master/src/cm6/extension.ts
+        //reference https://gist.github.com/ozntel/d571ac2c0f9881713e5692fcf16f7223
         const plugin = this;
-        const facet = Facet.define<Decoration>();
+        interface OperationStarted {
+            view?: EditorView;
+            state?: EditorState;
+        }
+        const operationStarted = StateEffect.define<OperationStarted>();
+        const operationEnded = StateEffect.define<DecorationSet>();
+        const runOperation = EditorState.transactionExtender.of(
+            (transaction: Transaction) => {
+                console.log(
+                    "🚀 ~ file: main.ts ~ line 55 ~ transaction",
+                    transaction
+                );
+                const editorView =
+                    transaction.startState.field(editorEditorField);
+
+                transaction.effects
+                    //  Filter Only the Transaction with Manual Operation Started Effect
+                    .filter((effect) => effect.is(operationStarted))
+                    //  Get Decorations for the Editor and Return to Operation End Effect
+                    .map(async (effect: StateEffect<OperationStarted>) => {
+                        let view = effect.value.view;
+                        let state = effect.value.state;
+                        console.log(
+                            "🚀 ~ file: main.ts ~ line 67 ~ state",
+                            state
+                        );
+                    });
+
+                return null;
+            }
+        );
         const field = StateField.define<DecorationSet>({
             create(state) {
+                console.log("🚀 ~ file: main.ts ~ line 80 ~ state", state);
                 // this will be called on plugin initialization and any editor state resets
                 // note: editor state is reset any time a new file is loaded into the editor
-                console.log("🚀 ~ file: main.ts ~ line 45 ~ state", state);
+
+                const view = state.field(editorEditorField);
+                view.dispatch({
+                    effects: [
+                        operationStarted.of({
+                            view,
+                            state
+                        })
+                    ]
+                });
+
                 return Decoration.none; // clear decorations
             },
             update(effects, tr) {
+                const editorView = tr.startState.field(editorEditorField);
+
                 effects = effects?.map(tr.changes);
                 if (tr.isUserEvent("select")) {
-                    console.log(tr.startState.field(field));
                     for (const effect of tr.effects) {
                         /* console.log(effect); */
                     }
@@ -62,7 +107,7 @@ export default class MarkdownAttributes extends Plugin {
 
             provide: (f) => EditorView.decorations.from(f)
         });
-        return field;
+        return [field, runOperation];
     }
 
     effect = StateEffect.define<ReplaceEffect>();
@@ -157,6 +202,7 @@ export default class MarkdownAttributes extends Plugin {
                 update(update: ViewUpdate) {
                     if (update.docChanged || update.viewportChanged) {
                         this.decorations = this.build(update.view);
+                    } else if (update.selectionSet) {
                     }
                 }
 
