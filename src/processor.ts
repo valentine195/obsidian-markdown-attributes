@@ -10,7 +10,7 @@ type ElementWithAttributes = {
 export default class Processor {
     static BASE_RE = /\{\:?[ ]*([^\}\n ][^\}\n]*)[ ]*\}/;
     static ONLY_RE = /^\{\:?[ ]*([^\}\n ][^\}\n]*)[ ]*\}$/;
-    static END_RE = /\{\:?[ ]*([^\}\n ][^\}\n]*)[ ]*\}$/;
+    static END_RE = /\{\:?[ ]*([^\}\n ][^\}\n]*)[ ]*\}$/m;
     static BLOCK_RE = /\n[ ]*\{\:?[ ]*([^\}\n ][^\}\n]*)[ ]*\}[ ]*$/;
 
     constructor() {}
@@ -29,7 +29,7 @@ export default class Processor {
         const elements: ElementWithAttributes[] = [];
         // Parse out the attribute string.
         let attribute_strings = text.matchAll(
-            new RegExp(Processor.END_RE.source, "g")
+            new RegExp(Processor.END_RE.source, "gm")
         );
 
         for (const [_, match] of attribute_strings) {

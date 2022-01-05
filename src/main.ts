@@ -41,100 +41,57 @@ export default class MarkdownAttributes extends Plugin {
 
     state() {
         //https://gist.github.com/nothingislost/faa89aa723254883d37f45fd16162337
-        type TokenSpec =
-            | {
-                  from: number;
-                  to: number;
-                  value: string;
-                  attributes: [string, string][];
-                  type: "mark";
-              }
-            | {
-                  from: number;
-                  to: number;
-                  loc: { from: number; to: number };
-                  value: string;
-                  index: number;
-                  type: "replace";
-              };
-
-        const statefulDecorations = defineStatefulDecoration();
+        type TokenSpec = {
+            from: number;
+            to: number;
+            loc: { from: number; to: number };
+            value: string;
+            index: number;
+            type: "replace";
+        };
 
         class StatefulDecorationSet {
             editor: EditorView;
-            decoCache: { [cls: string]: Decoration } = Object.create(null);
+            cache: { [cls: string]: Decoration } = Object.create(null);
 
             constructor(editor: EditorView) {
                 this.editor = editor;
             }
 
             async compute(tokens: TokenSpec[]) {
-                const mark: Range<Decoration>[] = [];
                 const replace: Range<Decoration>[] = [];
                 for (let token of tokens) {
-                    let deco = this.decoCache[token.value];
+                    let deco = this.cache[token.value];
                     if (!deco) {
-                        switch (token.type) {
-                            case "mark": {
-                                deco = this.decoCache[token.value] =
-                                    Decoration.mark({
-                                        attributes: Object.fromEntries(
-                                            token.attributes
-                                        )
-                                    });
-                                mark.push(deco.range(token.from, token.to));
-                                break;
-                            }
-                            case "replace": {
-                                deco = this.decoCache[token.value] =
-                                    Decoration.replace({
-                                        inclusive: true,
-                                        loc: token.loc
-                                    });
-                                replace.push(deco.range(token.from, token.to));
-                            }
-                        }
-                    } else {
-                        token.type == "mark"
-                            ? mark.push(deco.range(token.from, token.to))
-                            : replace.push(deco.range(token.from, token.to));
+                        deco = this.cache[token.value] = Decoration.replace({
+                            inclusive: true,
+                            loc: token.loc
+                        });
                     }
+                    replace.push(deco.range(token.from, token.to));
                 }
-                return {
-                    mark: Decoration.set(mark, true),
-                    replace: Decoration.set(replace, true)
-                };
+                return Decoration.set(replace, true);
             }
 
             async updateDecos(tokens: TokenSpec[]): Promise<void> {
-                const { mark, replace } = await this.compute(tokens);
+                const replacers = await this.compute(tokens);
                 // if our compute function returned nothing and the state field still has decorations, clear them out
-                if (
-                    mark ||
-                    replace ||
-                    this.editor.state.field(statefulDecorations.field).size
-                ) {
+                if (replace || this.editor.state.field(field).size) {
                     this.editor.dispatch({
-                        effects: [
-                            statefulDecorations.update.of(
-                                mark || Decoration.none
-                            ),
-                            statefulDecorations.replace.of(
-                                replace || Decoration.none
-                            )
-                        ]
+                        effects: [replace.of(replacers ?? Decoration.none)]
                     });
                 }
             }
         }
 
-        const asyncViewPlugin = ViewPlugin.fromClass(
+        const plugin = ViewPlugin.fromClass(
             class {
                 manager: StatefulDecorationSet;
+                decorations: DecorationSet;
 
                 constructor(view: EditorView) {
                     this.manager = new StatefulDecorationSet(view);
-                    this.build(view);
+                    this.decorations = this.build(view);
                 }
 
                 update(update: ViewUpdate) {
@@ -143,7 +100,7 @@ export default class MarkdownAttributes extends Plugin {
                         update.viewportChanged ||
                         update.selectionSet
                     ) {
-                        this.build(update.view);
+                        this.decorations = this.build(update.view);
                     }
                 }
 
@@ -151,6 +108,7 @@ export default class MarkdownAttributes extends Plugin {
 
                 build(view: EditorView) {
                     const targetElements: TokenSpec[] = [];
+                    const builder = new RangeSetBuilder<Decoration>();
                     for (let { from, to } of view.visibleRanges) {
                         const tree = syntaxTree(view.state);
                         tree.iterate({
@@ -159,36 +117,42 @@ export default class MarkdownAttributes extends Plugin {
                             enter: (type, from, to) => {
                                 const tokenProps =
                                     type.prop(tokenClassNodeProp);
-                                if (!tokenProps) return;
 
                                 const props = new Set(tokenProps?.split(" "));
-
-                                if (!props.size) return;
-                                if (props.has("hmd-codeblock")) return;
-
+                                if (
+                                    props.has("hmd-codeblock") &&
+                                    !props.has("formatting-code-block")
+                                )
+                                    return;
                                 const original = view.state.doc.sliceString(
                                     from,
                                     to
                                 );
 
-                                if (!Processor.END_RE.test(original)) return;
+                                //TODO: You will probably need to identify block types to determine from and to values to apply mark.
 
+                                if (!Processor.END_RE.test(original)) return;
                                 const parsed = Processor.parse(original) ?? [];
 
                                 for (const item of parsed) {
                                     const { attributes, text } = item;
-
-                                    targetElements.push({
-                                        from,
-                                        to,
-                                        attributes,
-                                        value: text,
-                                        type: "mark"
+                                    const end =
+                                        original.indexOf(text) + text.length;
+                                    const deco = Decoration.mark({
+                                        inclusive: true,
+                                        attributes:
+                                            Object.fromEntries(attributes)
                                     });
+                                    builder.add(from, end, deco);
 
-                                    const match = original.match(
-                                        new RegExp(`\\{\\s?${text}\s?\\}`)
-                                    );
+                                    const match = original
+                                        .trim()
+                                        .match(
+                                            new RegExp(
+                                                `\\{\\s?${text}\s?\\}$`,
+                                                "m"
+                                            )
+                                        );
                                     targetElements.push({
                                         type: "replace",
                                         from: from + match.index - 1,
@@ -196,7 +160,7 @@ export default class MarkdownAttributes extends Plugin {
                                             from +
                                             match.index +
                                             match[0].length,
-                                        loc: { from, to },
+                                        loc: { from, to: end },
                                         value: match[0],
                                         index: match.index
                                     });
@@ -205,7 +169,11 @@ export default class MarkdownAttributes extends Plugin {
                         });
                     }
                     this.manager.updateDecos(targetElements);
+                    return builder.finish();
                 }
+            },
+            {
+                decorations: (v) => v.decorations
             }
         );
 
@@ -213,232 +181,31 @@ export default class MarkdownAttributes extends Plugin {
         // Utility Code
         ////////////////
 
-        function defineStatefulDecoration() {
-            const update = StateEffect.define<DecorationSet>();
-            const replace = StateEffect.define<DecorationSet>();
-            const field = StateField.define<DecorationSet>({
-                create(): DecorationSet {
-                    return Decoration.none;
-                },
-                update(deco, tr): DecorationSet {
-                    return tr.effects.reduce((deco, effect) => {
-                        if (effect.is(update)) return effect.value;
-                        if (effect.is(replace))
-                            return effect.value.update({
-                                filter: (from, to, decoration) => {
-                                    return !rangesInclude(
-                                        tr.newSelection.ranges,
-                                        decoration.spec.loc.from,
-                                        decoration.spec.loc.to
-                                    );
-                                }
-                            });
-                        return deco;
-                    }, deco.map(tr.changes));
-                },
-                provide: (field) => EditorView.decorations.from(field)
-            });
-            return { update, field, replace };
-        }
-
-        return [statefulDecorations.field, asyncViewPlugin];
-    }
-
-    state_old() {
-        const DecorationField = PluginField.define<DecorationSet>();
-        const decorator = ViewPlugin.fromClass(
-            class {
-                decorations: DecorationSet;
-                constructor(view: EditorView) {
-                    this.decorations = this.build(view);
-                }
-                update(update: ViewUpdate) {
-                    if (update.docChanged || update.viewportChanged) {
-                        this.decorations = this.build(update.view);
-                    }
-                }
-
-                build(view: EditorView) {
-                    let builder = new RangeSetBuilder<Decoration>();
-                    for (let { from, to } of view.visibleRanges) {
-                        try {
-                            // syntaxTree gives us access to the tokens generated by the markdown parser
-                            // here we iterate over the visible text and evaluate each token, sequentially.
-                            const tree = syntaxTree(view.state);
-                            tree.iterate({
-                                from,
-                                to,
-                                enter: (type, from, to) => {
-                                    // To access the parsed tokens, we need to use a NodeProp.
-                                    // Obsidian exports their inline token NodeProp, tokenClassNodeProp, as part of their
-                                    // custom stream-parser package. See the readme for more details.
-
-                                    const tokenProps =
-                                        type.prop(tokenClassNodeProp);
-                                    const props = new Set(
-                                        tokenProps?.split(" ")
-                                    );
-
-                                    if (props.has("hmd-codeblock")) return;
-                                    const original = view.state.doc.sliceString(
-                                        from,
-                                        to
-                                    );
-
-                                    if (!Processor.END_RE.test(original))
-                                        return;
-                                    const parsed =
-                                        Processor.parse(original) ?? [];
-
-                                    for (const item of parsed) {
-                                        const { attributes } = item;
-
-                                        const deco = Decoration.mark({
-                                            attributes:
-                                                Object.fromEntries(attributes)
-                                        });
-
-                                        builder.add(from, to, deco);
-                                    }
-                                }
-                            });
-                        } catch (err) {
-                            // cm6 will silently unload extensions when they crash
-                            // this try/catch will provide details when crashes occur
-                            console.error(
-                                "Custom CM6 view plugin failure",
-                                err
-                            );
-                            // make to to throw because if you don't, you'll block
-                            // the auto unload and destabilize the editor
-                            throw err;
-                        }
-                    }
-                    return builder.finish();
-                }
+        const replace = StateEffect.define<DecorationSet>();
+        const field = StateField.define<DecorationSet>({
+            create(): DecorationSet {
+                return Decoration.none;
             },
-            {
-                decorations: (v) => v.decorations,
-                provide: DecorationField.from((v) => v.decorations)
-            }
-        );
-
-        const ReplacerField = PluginField.define<DecorationSet>();
-        const replacer = ViewPlugin.fromClass(
-            class {
-                decorations: DecorationSet;
-                constructor(view: EditorView) {
-                    this.decorations = this.build(view);
-                }
-                update(update: ViewUpdate) {
-                    if (update.docChanged || update.viewportChanged) {
-                        this.decorations = this.build(update.view);
-                    } else if (update.selectionSet) {
-                        this.decorations = this.build(
-                            update.view,
-                            update.transactions
-                        );
-                    }
-                }
-
-                build(
-                    view: EditorView,
-                    transactions: readonly Transaction[] = []
-                ) {
-                    const decorations: [
-                        from: number,
-                        to: number,
-                        value: Decoration
-                    ][] = [];
-                    for (let { from, to } of view.visibleRanges) {
-                        try {
-                            // syntaxTree gives us access to the tokens generated by the markdown parser
-                            // here we iterate over the visible text and evaluate each token, sequentially.
-                            const tree = syntaxTree(view.state);
-                            tree.iterate({
-                                from,
-                                to,
-                                enter: (type, from, to) => {
-                                    // To access the parsed tokens, we need to use a NodeProp.
-                                    // Obsidian exports their inline token NodeProp, tokenClassNodeProp, as part of their
-                                    // custom stream-parser package. See the readme for more details.
-
-                                    const tokenProps =
-                                        type.prop(tokenClassNodeProp);
-                                    const props = new Set(
-                                        tokenProps?.split(" ")
-                                    );
-
-                                    if (props.has("hmd-codeblock")) return;
-
-                                    const original = view.state.doc.sliceString(
-                                        from,
-                                        to
-                                    );
-
-                                    if (!Processor.END_RE.test(original))
-                                        return;
-                                    if (
-                                        rangesInclude(
-                                            transactions
-                                                .map((t) => t.selection.ranges)
-                                                .flat(),
-                                            from,
-                                            to
-                                        )
-                                    ) {
-                                        return;
-                                    }
-                                    const parsed =
-                                        Processor.parse(original) ?? [];
-
-                                    for (const item of parsed) {
-                                        const { text } = item;
-
-                                        const match = original.match(
-                                            new RegExp(`\\{\\s?${text}\s?\\}`)
-                                        );
-                                        const replace = Decoration.replace({
-                                            inclusive: true
-                                        });
-
-                                        decorations.push([
-                                            from + match.index - 1,
-                                            from +
-                                                match.index +
-                                                match[0].length,
-                                            replace
-                                        ]);
-                                    }
-                                }
-                            });
-                        } catch (err) {
-                            // cm6 will silently unload extensions when they crash
-                            // this try/catch will provide details when crashes occur
-                            console.error(
-                                "Custom CM6 view plugin failure",
-                                err
-                            );
-                            // make to to throw because if you don't, you'll block
-                            // the auto unload and destabilize the editor
-                            throw err;
-                        }
-                    }
-                    let builder = new RangeSetBuilder<Decoration>();
-                    decorations
-                        .sort((a, b) => a[0] - b[0])
-                        .forEach((set) => builder.add(...set));
-                    return builder.finish();
-                }
+            update(deco, tr): DecorationSet {
+                return tr.effects.reduce((deco, effect) => {
+                    if (effect.is(replace))
+                        return effect.value.update({
+                            filter: (_, __, decoration) => {
+                                return !rangesInclude(
+                                    tr.newSelection.ranges,
+                                    decoration.spec.loc.from,
+                                    decoration.spec.loc.to
+                                );
+                            }
+                        });
+                    return deco;
+                }, deco.map(tr.changes));
             },
-            {
-                decorations: (v) => v.decorations,
-                provide: ReplacerField.from((v) => v.decorations)
-            }
-        );
-        return [replacer, decorator];
-    }
+            provide: (field) => EditorView.decorations.from(field)
+        });
 
+        return [field, plugin];
+    }
     async postprocessor(
         topElement: HTMLElement,
         ctx: MarkdownPostProcessorContext
