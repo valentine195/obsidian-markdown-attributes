@@ -23,7 +23,8 @@ import {
     StateField,
     Transaction,
     StateEffectType,
-    SelectionRange
+    SelectionRange,
+    ChangeSet
 } from "@codemirror/state";
 
 type ReplaceEffect = { from: number; to: number; text: string };
@@ -51,6 +52,7 @@ export default class MarkdownAttributes extends Plugin {
             | {
                   from: number;
                   to: number;
+                  loc: { from: number; to: number };
                   value: string;
                   index: number;
                   type: "replace";
@@ -66,7 +68,7 @@ export default class MarkdownAttributes extends Plugin {
                 this.editor = editor;
             }
 
-            async computeAsyncDecorations(tokens: TokenSpec[]) {
+            async compute(tokens: TokenSpec[]) {
                 const mark: Range<Decoration>[] = [];
                 const replace: Range<Decoration>[] = [];
                 for (let token of tokens) {
@@ -74,27 +76,28 @@ export default class MarkdownAttributes extends Plugin {
                     if (!deco) {
                         switch (token.type) {
                             case "mark": {
-                                mark.push(
+                                deco = this.decoCache[token.value] =
                                     Decoration.mark({
                                         attributes: Object.fromEntries(
                                             token.attributes
                                         )
-                                    }).range(token.from, token.to)
-                                );
+                                    });
+                                mark.push(deco.range(token.from, token.to));
                                 break;
                             }
                             case "replace": {
-                                replace.push(
+                                deco = this.decoCache[token.value] =
                                     Decoration.replace({
                                         inclusive: true,
-                                        widget: new ReplaceWidget(
-                                            token.value,
-                                            true
-                                        )
-                                    }).range(token.from, token.to)
-                                );
+                                        loc: token.loc
+                                    });
+                                replace.push(deco.range(token.from, token.to));
                             }
                         }
+                    } else {
+                        token.type == "mark"
+                            ? mark.push(deco.range(token.from, token.to))
+                            : replace.push(deco.range(token.from, token.to));
                     }
                 }
                 return {
@@ -103,10 +106,8 @@ export default class MarkdownAttributes extends Plugin {
                 };
             }
 
-            async updateAsyncDecorations(tokens: TokenSpec[]): Promise<void> {
-                const { mark, replace } = await this.computeAsyncDecorations(
-                    tokens
-                );
+            async updateDecos(tokens: TokenSpec[]): Promise<void> {
+                const { mark, replace } = await this.compute(tokens);
                 // if our compute function returned nothing and the state field still has decorations, clear them out
                 if (
                     mark ||
@@ -127,36 +128,28 @@ export default class MarkdownAttributes extends Plugin {
             }
         }
 
-        class ReplaceWidget extends WidgetType {
-            constructor(public text: string, public hide: boolean) {
-                super();
-            }
-            eq(other: ReplaceWidget) {
-                return other.text == this.text && other.hide == this.hide;
-            }
-            toDOM(view: EditorView) {
-                return createSpan({ text: this.hide ? "" : this.text });
-            }
-        }
-
         const asyncViewPlugin = ViewPlugin.fromClass(
             class {
-                decoManager: StatefulDecorationSet;
+                manager: StatefulDecorationSet;
 
                 constructor(view: EditorView) {
-                    this.decoManager = new StatefulDecorationSet(view);
-                    this.buildAsyncDecorations(view);
+                    this.manager = new StatefulDecorationSet(view);
+                    this.build(view);
                 }
 
                 update(update: ViewUpdate) {
-                    if (update.docChanged || update.viewportChanged) {
-                        this.buildAsyncDecorations(update.view);
+                    if (
+                        update.docChanged ||
+                        update.viewportChanged ||
+                        update.selectionSet
+                    ) {
+                        this.build(update.view);
                     }
                 }
 
                 destroy() {}
 
-                buildAsyncDecorations(view: EditorView) {
+                build(view: EditorView) {
                     const targetElements: TokenSpec[] = [];
                     for (let { from, to } of view.visibleRanges) {
                         const tree = syntaxTree(view.state);
@@ -203,6 +196,7 @@ export default class MarkdownAttributes extends Plugin {
                                             from +
                                             match.index +
                                             match[0].length,
+                                        loc: { from, to },
                                         value: match[0],
                                         index: match.index
                                     });
@@ -210,7 +204,7 @@ export default class MarkdownAttributes extends Plugin {
                             }
                         });
                     }
-                    this.decoManager.updateAsyncDecorations(targetElements);
+                    this.manager.updateDecos(targetElements);
                 }
             }
         );
@@ -227,37 +221,20 @@ export default class MarkdownAttributes extends Plugin {
                     return Decoration.none;
                 },
                 update(deco, tr): DecorationSet {
-                    if (tr.newSelection) {
-                        console.log(
-                            "🚀 ~ file: main.ts ~ line 233 ~ tr.newSelection",
-                            tr.newSelection.ranges
-                        );
-                        for (const effect of tr.effects) {
-                            if (effect.is(replace)) {
-                                effect.value.between(
-                                    tr.newSelection.ranges[0].from,
-                                    tr.newSelection.ranges[0].to,
-                                    (from, to, decoration) => {
-                                        console.log(
-                                            "🚀 ~ file: main.ts ~ line 239 ~ decoration",
-                                            decoration
-                                        );
-                                        if (decoration.spec.widget.hide) {
-                                            decoration.spec.widget.hide = false;
-                                        }
-                                    }
-                                );
-                            }
-                        }
-                    }
-
-                    return tr.effects.reduce(
-                        (deco, effect) =>
-                            effect.is(update) || effect.is(replace)
-                                ? effect.value
-                                : deco,
-                        deco.map(tr.changes)
-                    );
+                    return tr.effects.reduce((deco, effect) => {
+                        if (effect.is(update)) return effect.value;
+                        if (effect.is(replace))
+                            return effect.value.update({
+                                filter: (from, to, decoration) => {
+                                    return !rangesInclude(
+                                        tr.newSelection.ranges,
+                                        decoration.spec.loc.from,
+                                        decoration.spec.loc.to
+                                    );
+                                }
+                            });
+                        return deco;
+                    }, deco.map(tr.changes));
                 },
                 provide: (field) => EditorView.decorations.from(field)
             });
@@ -566,7 +543,11 @@ export default class MarkdownAttributes extends Plugin {
     }
 }
 
-const rangesInclude = (ranges: SelectionRange[], from: number, to: number) => {
+const rangesInclude = (
+    ranges: readonly SelectionRange[],
+    from: number,
+    to: number
+) => {
     for (const range of ranges) {
         const { from: rFrom, to: rTo } = range;
         if (rFrom >= from && rFrom <= to) return true;
