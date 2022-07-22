@@ -1,29 +1,28 @@
 import {
-    editorLivePreviewField,
-    editorViewField,
-    MarkdownPostProcessorContext,
-    Plugin,
-    requireApiVersion,
-    TFile
-} from "obsidian";
-import { Range } from "@codemirror/rangeset";
-import {
-    EditorView,
     Decoration,
-    ViewPlugin,
     DecorationSet,
+    EditorView,
+    ViewPlugin,
     ViewUpdate
 } from "@codemirror/view";
-import { syntaxTree } from "@codemirror/language";
-import { tokenClassNodeProp } from "@codemirror/stream-parser";
 import {
+    EditorState,
     SelectionRange,
     StateEffect,
-    StateField,
-    EditorState
+    StateField
 } from "@codemirror/state";
+import {
+    MarkdownPostProcessorContext,
+    Plugin,
+    TFile,
+    editorLivePreviewField,
+    editorViewField,
+    requireApiVersion
+} from "obsidian";
+import { syntaxTree, tokenClassNodeProp } from "@codemirror/language";
 
 import Processor from "./processor";
+import { Range } from "@codemirror/rangeset";
 
 export const isLivePreview = (state: EditorState) => {
     if (requireApiVersion && requireApiVersion("0.13.23")) {
@@ -162,21 +161,22 @@ export default class MarkdownAttributes extends Plugin {
                 const replace: Range<Decoration>[] = [];
                 for (let token of tokens) {
                     //need to add in additional locations to the caches so that the reveal transaction will properly surface them
-
                     const deco = Decoration.replace({
                         inclusive: true,
-                        loc: token.loc
+						loc: token.loc
                     });
 
                     const marker = Decoration.mark({
                         inclusive: true,
                         attributes: Object.fromEntries(token.attributes),
-                        loc: token.loc
+						loc: {
+							from: token.from,
+							to: token.to
+						}
                     });
-
                     replace.push(
                         deco.range(token.from, token.to),
-                        marker.range(token.loc.from, token.loc.to)
+                        marker.range(token.from, token.to)
                     );
                 }
                 return Decoration.set(replace, true);
@@ -232,7 +232,7 @@ export default class MarkdownAttributes extends Plugin {
                         tree.iterate({
                             from,
                             to,
-                            enter: (type, from, to) => {
+                            enter: ({type, from, to}) => {
                                 const tokenProps =
                                     type.prop(tokenClassNodeProp);
 
@@ -296,7 +296,7 @@ export default class MarkdownAttributes extends Plugin {
                 return tr.effects.reduce((deco, effect) => {
                     if (effect.is(replace))
                         return effect.value.update({
-                            filter: (_, __, decoration) => {
+							filter: (_, __, decoration) => {
                                 return !rangesInclude(
                                     tr.newSelection.ranges,
                                     decoration.spec.loc.from,
